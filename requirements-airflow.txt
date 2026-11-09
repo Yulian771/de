@@ -1,0 +1,4 @@
+psycopg[binary]==3.3.8
+catboost==1.2.10
+scikit-learn==1.8.0
+clickhouse-connect==1.12.0

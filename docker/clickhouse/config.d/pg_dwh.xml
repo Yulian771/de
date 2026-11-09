@@ -1,0 +1,12 @@
+<clickhouse>
+    <named_collections>
+        <pg_dwh>
+            <host from_env="PG_DWH_HOST"/>
+            <port from_env="PG_DWH_PORT"/>
+            <database from_env="PG_DWH_DB"/>
+            <user from_env="PG_DWH_USER"/>
+            <password from_env="PG_DWH_PASSWORD"/>
+            <schema>core</schema>
+        </pg_dwh>
+    </named_collections>
+</clickhouse>

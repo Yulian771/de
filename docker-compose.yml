@@ -1,0 +1,184 @@
+name: ul-platform
+
+# Переменные для сервисов
+x-app-env: &app-env
+  SOURCE_DB_HOST: postgres
+  SOURCE_DB_PORT: "5432"
+  SOURCE_DB_NAME: ${SOURCE_DB_NAME:-deals_bigdata}
+  SOURCE_DB_USER: ${ETL_DB_USER:-ul_etl}
+  SOURCE_DB_PASSWORD: ${ETL_DB_PASSWORD:-ul_etl}
+
+  DWH_DB_HOST: postgres
+  DWH_DB_PORT: "5432"
+  DWH_DB_NAME: ${DWH_DB_NAME:-dwh}
+  DWH_DB_USER: ${ETL_DB_USER:-ul_etl}
+  DWH_DB_PASSWORD: ${ETL_DB_PASSWORD:-ul_etl}
+
+  AS_OF: ${AS_OF:-2026-10-26}
+  RANDOM_SEED: ${RANDOM_SEED:-42}
+
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_PORT: "8123"
+  CLICKHOUSE_USER: ${CLICKHOUSE_ETL_USER:-ul_etl}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:-ul_etl}
+  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ul_platform}
+
+services:
+  # PG с данными
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${SOURCE_DB_NAME:-deals_bigdata}
+      DWH_DB_NAME: ${DWH_DB_NAME:-dwh}
+      N_PRICES: ${N_PRICES:-300000}
+      ETL_DB_USER: ${ETL_DB_USER:-ul_etl}
+      ETL_DB_PASSWORD: ${ETL_DB_PASSWORD:-ul_etl}
+
+    command: ["postgres", "-c", "shared_buffers=256MB", "-c", "work_mem=64MB", "-c", "max_connections=200"]
+    volumes:
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - ./sql/source:/sql/source:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 120
+      start_period: 30s
+
+  # Основное приложение
+  app:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    image: ul-platform-app:latest
+    environment:
+      <<: *app-env
+      MODEL_DIR: /app/artifacts
+    command: ["python", "-m", "pipeline", "run-all"]
+    volumes:
+      - artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ClickHouse (бонусное задание)
+  clickhouse:
+    profiles: ["bonus_task"]
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      # CLICKHOUSE_USER не задаём: entrypoint оставит пользователя default и задаст ему этот пароль
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-admin}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      # подключение к DWH для именованной коллекции
+      PG_DWH_HOST: postgres
+      PG_DWH_PORT: "5432"
+      PG_DWH_DB: ${DWH_DB_NAME:-dwh}
+      PG_DWH_USER: ${ETL_DB_USER:-ul_etl}
+      PG_DWH_PASSWORD: ${ETL_DB_PASSWORD:-ul_etl}
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    volumes:
+      - chdata:/var/lib/clickhouse
+      - ./docker/clickhouse/config.d/pg_dwh.xml:/etc/clickhouse-server/config.d/pg_dwh.xml:ro
+      - ./docker/clickhouse/users.d/zz-admin.xml:/etc/clickhouse-server/users.d/zz-admin.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --password \"$${CLICKHOUSE_PASSWORD}\" --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # DDL ClickHouse и ETL-пользователь (бонусное задание)
+  clickhouse-init:
+    profiles: ["bonus_task"]
+    image: ul-platform-app:latest
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    environment:
+      <<: *app-env
+      CLICKHOUSE_ADMIN_USER: default
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-admin}
+    command: ["python", "-m", "pipeline", "clickhouse-init"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+
+  # Пайп до CH (бонусное задание)
+  clickhouse-sync:
+    profiles: ["bonus_task"]
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    image: ul-platform-app:latest
+    environment:
+      <<: *app-env
+    command: ["python", "-m", "pipeline", "clickhouse-sync", "--full"]
+    depends_on:
+      app:
+        condition: service_completed_successfully
+      clickhouse-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # БД Airflow (бонусное задание)
+  airflow-db:
+    profiles: ["bonus_task"]
+    image: postgres:17
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Airflow 3 (бонусное задание)
+  # (standalone: все компоненты в одном контейнере, без авторизации)
+  airflow:
+    profiles: ["bonus_task"]
+    build:
+      context: .
+      dockerfile: docker/airflow.Dockerfile
+    image: ul-platform-airflow:latest
+    command: ["standalone"]
+    environment:
+      <<: *app-env
+      MODEL_DIR: /opt/airflow/artifacts
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@airflow-db:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "True"
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+      - artifacts:/opt/airflow/artifacts
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      clickhouse-init:
+        condition: service_completed_successfully
+
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  chdata:
+  airflow-db-data:
+  artifacts:
