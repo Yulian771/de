@@ -99,9 +99,7 @@ services:
   clickhouse-init:
     profiles: ["bonus_task"]
     image: ul-platform-app:latest
-    build:
-      context: .
-      dockerfile: docker/app.Dockerfile
+    pull_policy: never
     environment:
       <<: *app-env
       CLICKHOUSE_ADMIN_USER: default
@@ -115,10 +113,8 @@ services:
   # Пайп до CH (бонусное задание)
   clickhouse-sync:
     profiles: ["bonus_task"]
-    build:
-      context: .
-      dockerfile: docker/app.Dockerfile
     image: ul-platform-app:latest
+    pull_policy: never
     environment:
       <<: *app-env
     command: ["python", "-m", "pipeline", "clickhouse-sync", "--full"]

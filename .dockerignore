@@ -1,5 +1,6 @@
 .git
 .env
+.venv
 artifacts
 **/__pycache__
 **/*.pyc
