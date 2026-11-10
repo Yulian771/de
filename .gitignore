@@ -6,3 +6,4 @@ __pycache__/
 artifacts/
 .pytest_cache/
 catboost_info/
+.DS_Store
