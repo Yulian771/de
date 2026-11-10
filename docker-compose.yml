@@ -117,7 +117,7 @@ services:
     pull_policy: never
     environment:
       <<: *app-env
-    command: ["python", "-m", "pipeline", "clickhouse-sync", "--full"]
+    command: ["python", "-m", "pipeline", "clickhouse-sync"]
     depends_on:
       app:
         condition: service_completed_successfully
