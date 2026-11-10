@@ -50,14 +50,6 @@ CREATE TABLE IF NOT EXISTS core.dim_city (
     updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS core.dim_body_type (
-    body_type_id integer PRIMARY KEY,
-    name         text    NOT NULL,
-    std_id       integer,
-    body_group   text    NOT NULL,
-    updated_at   timestamptz NOT NULL DEFAULT now()
-);
-
 CREATE TABLE IF NOT EXISTS core.exchange_rate (
     num_code     varchar(3) NOT NULL,
     setting_date date       NOT NULL,

@@ -52,7 +52,7 @@ def test_clickhouse_repeats_months_recomputed_in_postgres(dwh, settings, as_of):
     from etl.marts import build_marts
     from etl.window import Window
     sync_clickhouse(settings)
-    build_marts(settings, as_of)                                   # инкремент: последние N месяцев
+    build_marts(settings, as_of, incremental=True)                 # последние N месяцев
     stats = sync_clickhouse(settings, Window(as_of, as_of))
     assert stats["months_recomputed"] == settings.mart_lookback_months
     assert stats["mismatches"] == {}

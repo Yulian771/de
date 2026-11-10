@@ -40,8 +40,15 @@ def test_missing_bound_is_taken_from_full_range():
         == Window(date(2026, 9, 1), date(2026, 9, 2))
 
 
-def test_as_of_priority_explicit_then_configured_then_data_end():
-    data_end = lambda: date(2026, 10, 26)   # noqa: E731
-    assert resolve_as_of(date(2026, 11, 1), date(2026, 10, 1), data_end) == date(2026, 11, 1)
-    assert resolve_as_of(None, date(2026, 10, 1), data_end) == date(2026, 10, 1)
-    assert resolve_as_of(None, None, data_end) == date(2026, 10, 26)
+def test_as_of_priority_explicit_then_configured_then_last_data_day():
+    last = date(2026, 10, 26)
+    assert resolve_as_of(date(2026, 10, 20), date(2026, 10, 1), last) == date(2026, 10, 20)
+    assert resolve_as_of(None, date(2026, 10, 1), last) == date(2026, 10, 1)
+    assert resolve_as_of(None, None, last) == last
+
+
+def test_as_of_cannot_be_after_last_data_day():
+    with pytest.raises(ValueError, match="later than the last day of data"):
+        resolve_as_of(date(2026, 11, 9), None, date(2026, 10, 26))
+    with pytest.raises(ValueError):
+        resolve_as_of(None, date(2026, 11, 9), date(2026, 10, 26))

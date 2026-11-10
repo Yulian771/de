@@ -50,7 +50,6 @@ def run_transform(settings: Settings, window: Window) -> dict:
 
 def transform_prices(conn: psycopg.Connection, settings: Settings, window: Window) -> dict:
     """Сделки raw -> core / карантин и сверка — внутри транзакции"""
-    # conn.execute("SET LOCAL jit = off")
     set_params(conn, {"etl.window_start": window.start, "etl.window_end_excl": window.end_excl})
     run_sql_dir(conn, settings.sql_dir / "transforms" / "core_prices")
     return _reconcile(conn, window)
@@ -63,10 +62,13 @@ def _lock_layers(conn: psycopg.Connection) -> None:
 
 
 def _dimension_counts(conn: psycopg.Connection) -> dict:
-    """Число строк в справочниках core после их обновления"""
-    return dict(zip(("dim_city", "dim_body_type", "exchange_rate"), conn.execute(
-        "SELECT (SELECT count(*) FROM core.dim_city), (SELECT count(*) FROM core.dim_body_type), "
-        "(SELECT count(*) FROM core.exchange_rate)").fetchone()))
+    """Число строк в справочниках core после их обновления — для статистики шага (etl.run_log и лог).
+
+    Возвращает {"dim_city": ..., "exchange_rate": ...}.
+    Вызывается внутри транзакции transform_dimensions, поэтому видит уже обновлённые, но ещё не закоммиченные данные.
+    """
+    return dict(zip(("dim_city", "exchange_rate"), conn.execute(
+        "SELECT (SELECT count(*) FROM core.dim_city), (SELECT count(*) FROM core.exchange_rate)").fetchone()))
 
 
 def _reconcile(conn: psycopg.Connection, window: Window) -> dict:

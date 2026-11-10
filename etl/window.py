@@ -1,8 +1,9 @@
 """Окна загрузки по prices.updated_at
 
-Каждый шаг ETL — идемпотентная задача на окно [start, end].
-Период длиннее месяца делится на календарные месяцы —
-по транзакции на месяц, таким образом сбой откатывает только текущий месяц.
+Каждый шаг ETL — идемпотентная задача на окно [start, end] без хранимого состояния:
+extract и transform за одно и то же окно обрабатывают одни и те же сделки, повторный запуск
+даёт тот же результат. Период длиннее месяца (backfill) делится на календарные месяцы —
+по транзакции на месяц, сбой откатывает только текущий месяц.
 """
 
 from dataclasses import dataclass
@@ -55,14 +56,22 @@ def updated_at_range(conn: psycopg.Connection, table: sql.Composable) -> Window:
     if first is None:
         raise RuntimeError(f"Table {table.as_string(conn)} has no rows with updated_at")
     if no_mark:
-        # Сделки без updated_at ни в одно окно не попадут
         log.warning("window.updated_at_null", extra={"table": table.as_string(conn), "rows": no_mark})
     return Window(first, last)
 
 
-def resolve_as_of(explicit: date | None, configured: date | None, data_end: Callable[[], date]) -> date:
-    """Дата снимка as_of (сделки после неё — будущее: не входят в витрину)."""
-    return explicit or configured or data_end()
+def resolve_as_of(explicit: date | None, configured: date | None, last_data_day: date) -> date:
+    """Дата снимка as_of (сделки после неё — будущее: не входят в витрину, для ML — заявки на скоринг).
+
+    Порядок: явная (CLI --as-of, параметр DAG) > настроенная (AS_OF) > последний день данных.
+    Снимок не может быть позже последнего дня данных (последнего updated_at): иначе плановые заявки
+    до as_of считались бы фактом, а будущие месяцы попали бы в витрину.
+    """
+    as_of = explicit or configured or last_data_day
+    if as_of > last_data_day:
+        raise ValueError(f"as_of {as_of} is later than the last day of data {last_data_day}: "
+                         "a snapshot cannot be taken after the data it is built on")
+    return as_of
 
 
 def resolve_window(start: date | None, end: date | None, full: Callable[[], Window]) -> Window:

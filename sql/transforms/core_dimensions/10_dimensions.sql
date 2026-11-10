@@ -27,17 +27,6 @@ ON CONFLICT (gc_id) DO UPDATE SET
     duplicates_cnt  = EXCLUDED.duplicates_cnt,
     updated_at      = now();
 
--- Типы кузова с бизнес-группой; неизвестные коды -> «Прочие».
-INSERT INTO core.dim_body_type (body_type_id, name, std_id, body_group, updated_at)
-SELECT b.id, b.name, b.std_id, COALESCE(m.body_group, 'Прочие'), now()
-FROM raw.body_types b
-LEFT JOIN core.body_group_map m ON m.body_type_id = b.id
-ON CONFLICT (body_type_id) DO UPDATE SET
-    name       = EXCLUDED.name,
-    std_id     = EXCLUDED.std_id,
-    body_group = EXCLUDED.body_group,
-    updated_at = now();
-
 -- Курсы ЦБ: при дублях (num_code, setting_date) берём последнюю загруженную запись.
 INSERT INTO core.exchange_rate (num_code, setting_date, value)
 SELECT DISTINCT ON (num_code, setting_date) num_code, setting_date, value

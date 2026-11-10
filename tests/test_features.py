@@ -31,19 +31,12 @@ def test_time_split_matches_task_boundaries():
     assert not (m["train"] & m["test"]).any()
 
 
-def test_scoring_labels_use_model_as_of_and_scoring_as_of():
-    """Модель обучена на 2026-10-26, скоринг на 2026-11-09: test — её отложенный период,
-    live — сделки после обучения с известным фактом, future — после даты скоринга; train не скорится."""
+def test_scoring_requires_model_as_of():
+    """Скоринг — только на дату снимка, на которую обучена модель; на другую дату — переобучить."""
     split = TimeSplit.from_as_of(date(2026, 10, 26))
-    days = pd.Series(pd.to_datetime(["2026-10-04", "2026-10-05", "2026-10-26", "2026-10-27",
-                                     "2026-11-09", "2026-11-10"]))
-    assert split.scoring_labels(days, date(2026, 11, 9)).tolist() == \
-        [None, "test", "test", "live", "live", "future"]
-    # Скоринг на дату обучения — как в задании: только test и future.
-    assert split.scoring_labels(days, date(2026, 10, 26)).tolist() == \
-        [None, "test", "test", "future", "future", "future"]
-    with pytest.raises(ValueError):
-        split.scoring_labels(days, date(2026, 10, 25))
+    split.require_as_of(date(2026, 10, 26))
+    with pytest.raises(ValueError, match="ml train --as-of 2026-10-20"):
+        split.require_as_of(date(2026, 10, 20))
 
 
 def _row(loading_date: str) -> dict:

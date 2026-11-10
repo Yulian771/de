@@ -45,14 +45,13 @@ SELECT DISTINCT ON (loading_city_gcid, unloading_city_gcid, body_group, weight_c
 FROM mart.mart_route_card
 ORDER BY loading_city_gcid, unloading_city_gcid, body_group, weight_category, month DESC;
 
--- Пакетный скоринг: факт vs прогноз.
--- split: test — отложенный период модели; live — сделки после обучения с известным фактом
--- (точность на новых данных); future — плановые заявки после даты скоринга, факт не известен.
+-- Пакетный скоринг основной модели: факт vs прогноз (baselines — только метрики в ml_model_metrics).
+-- split: test — отложенный период модели; future — плановые заявки с loading_date > as_of, факт не известен.
 CREATE TABLE IF NOT EXISTS mart.ml_price_predictions (
     price_id            bigint      NOT NULL,
     model_name          text        NOT NULL,
     model_version       text        NOT NULL,
-    split               text        NOT NULL CHECK (split IN ('test', 'live', 'future')),
+    split               text        NOT NULL CHECK (split IN ('test', 'future')),
     loading_date        date        NOT NULL,
     loading_city_gcid   integer     NOT NULL,
     unloading_city_gcid integer     NOT NULL,
@@ -66,7 +65,7 @@ CREATE TABLE IF NOT EXISTS mart.ml_price_predictions (
     ape_pct             numeric(10, 2),
     scored_at           timestamptz NOT NULL,
     PRIMARY KEY (price_id, model_name),
-    CHECK (split <> 'future' OR (actual_price_rub IS NULL AND abs_error_rub IS NULL AND ape_pct IS NULL))
+    CHECK (split = 'test' OR (actual_price_rub IS NULL AND abs_error_rub IS NULL AND ape_pct IS NULL))
 );
 CREATE INDEX IF NOT EXISTS ml_price_predictions_date_idx ON mart.ml_price_predictions (loading_date);
 
@@ -85,6 +84,10 @@ CREATE TABLE IF NOT EXISTS mart.ml_model_metrics (
     trained_at    timestamptz NOT NULL,
     PRIMARY KEY (model_name, as_of, split)
 );
+
+-- Поиск ячеек по маршруту (карточка маршрута, последний доступный коридор).
+CREATE INDEX IF NOT EXISTS mart_route_card_route_idx
+    ON mart.mart_route_card (loading_city_gcid, unloading_city_gcid, body_group, weight_category, month);
 
 -- Факт vs прогноз vs рыночный коридор: подсветка рейсов, закрытых заметно выше рынка.
 CREATE OR REPLACE VIEW mart.v_fact_vs_forecast AS
@@ -107,14 +110,20 @@ SELECT p.price_id,
        CASE WHEN p.actual_price_rub IS NULL THEN NULL
             ELSE p.actual_price_rub > p.predicted_price_rub * 1.15 END AS above_forecast_15pct,
        CASE WHEN p.actual_price_rub IS NULL OR c.p75_trip IS NULL THEN NULL
-            ELSE p.actual_price_rub > c.p75_trip END                AS above_market_p75
+            ELSE p.actual_price_rub > c.p75_trip END                AS above_market_p75,
+       c.month                                                      AS corridor_month
 FROM mart.ml_price_predictions p
-LEFT JOIN mart.mart_route_card c
-       ON c.month = date_trunc('month', p.loading_date)::date
-      AND c.loading_city_gcid = p.loading_city_gcid
-      AND c.unloading_city_gcid = p.unloading_city_gcid
-      AND c.body_group = p.body_group
-      AND c.weight_category = p.weight_category;
+LEFT JOIN LATERAL (
+    SELECT r.month, r.p25_trip, r.median_trip, r.p75_trip, r.reliability_level
+    FROM mart.mart_route_card r
+    WHERE r.loading_city_gcid = p.loading_city_gcid
+      AND r.unloading_city_gcid = p.unloading_city_gcid
+      AND r.body_group = p.body_group
+      AND r.weight_category = p.weight_category
+      AND r.month <= date_trunc('month', p.loading_date)::date
+    ORDER BY r.month DESC
+    LIMIT 1
+) c ON true;
 
 -- Качество модели по сегментам (на отложенном test без размеченных выбросов).
 -- Иллюстрирует вывод R&D-отчёта: на узком сегменте R^2 падает при норм MAPE.

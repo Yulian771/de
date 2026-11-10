@@ -1,9 +1,8 @@
-"""Хронологическое разбиение относительно фиксированной даты снимка as_of"""
+"""Хронологическое разбиение относительно фиксированной даты снимка as_of (не системной даты)."""
 
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-import numpy as np
 import pandas as pd
 
 
@@ -29,18 +28,9 @@ class TimeSplit:
             "future": d > self.as_of,
         }
 
-    def scoring_labels(self, loading_date: pd.Series, scoring_as_of: date) -> pd.Series:
-        """Разметка сделок для скоринга моделью, обученной на этом разбиении:
-
-          test   — отложенный период модели [test_start, as_of] (на нём считались метрики обучения);
-          live   — после обучения, факт уже известен: (as_of, scoring_as_of] — точность на новых данных;
-          future — плановые заявки после даты скоринга (loading_date > scoring_as_of), факт не известен.
-        Период train не скорится (None).
-        """
-        if scoring_as_of < self.as_of:
-            raise ValueError(f"scoring as_of {scoring_as_of} is earlier than model as_of {self.as_of}")
-        d = pd.to_datetime(loading_date).dt.date
-        labels = np.select(
-            [(d >= self.test_start) & (d <= self.as_of), (d > self.as_of) & (d <= scoring_as_of), d > scoring_as_of],
-            ["test", "live", "future"], default=None)
-        return pd.Series(labels, index=loading_date.index, dtype=object)
+    def require_as_of(self, as_of: date) -> None:
+        """Скоринг — на ту же дату снимка, на которую модель обучена: test — её отложенный период,
+        future — заявки после as_of. На другую дату модель нужно переобучить."""
+        if as_of != self.as_of:
+            raise ValueError(f"model is trained for as_of {self.as_of}, scoring requested for {as_of}: "
+                             f"run `ml train --as-of {as_of}` first")

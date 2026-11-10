@@ -49,7 +49,7 @@ def test_transform_rerun_without_extract_is_idempotent(dwh, settings, as_of):
 def test_mart_rebuild_is_idempotent(dwh, settings, as_of):
     """Инкремент и полный пересчёт на ту же дату не меняют витрину."""
     before = snapshot(dwh)
+    build_marts(settings, as_of, incremental=True)
     build_marts(settings, as_of)
-    build_marts(settings, as_of, full=True)
-    build_marts(settings, as_of)
+    build_marts(settings, as_of, incremental=True)
     assert snapshot(dwh) == before

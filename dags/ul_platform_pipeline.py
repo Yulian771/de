@@ -24,7 +24,7 @@ def _window(window: dict):
 
 @task
 def resolve_window(use_data_interval: bool) -> dict:
-    """Окно запуска и дата снимка as_of: params, иначе data interval (daily), иначе весь источник."""
+    """Окно запуска (params, иначе data interval для daily, иначе весь источник) и дата снимка as_of."""
     from etl.extract import source_window
     from etl.window import resolve_as_of
     from etl.window import resolve_window as _resolve_window
@@ -39,8 +39,9 @@ def resolve_window(use_data_interval: bool) -> dict:
         start = min(interval_start, interval_end).isoformat()
         end = interval_end.isoformat()
     settings = _settings()
+    data_end = source_window(settings).end                  # последний updated_at в источнике
     window = _resolve_window(_param_date(start), _param_date(end), lambda: source_window(settings))
-    as_of = resolve_as_of(_param_date(params.get("as_of")), None, lambda: window.end)
+    as_of = resolve_as_of(_param_date(params.get("as_of")), settings.as_of, data_end)
     return {"start": window.start.isoformat(), "end": window.end.isoformat(), "as_of": as_of.isoformat()}
 
 
@@ -63,9 +64,9 @@ def transform(window: dict) -> dict:
 
 
 @task
-def marts(window: dict, full: bool) -> dict:
+def marts(window: dict, incremental: bool = False) -> dict:
     from etl.marts import build_marts
-    return build_marts(_settings(), date.fromisoformat(window["as_of"]), full=full)
+    return build_marts(_settings(), date.fromisoformat(window["as_of"]), incremental=incremental)
 
 
 @task
@@ -96,7 +97,7 @@ def clickhouse_sync() -> dict:
 WINDOW_PARAMS = {
     "start_date": Param(None, type=["null", "string"], format="date", description="дата с (включительно)"),
     "end_date": Param(None, type=["null", "string"], format="date", description="дата по (включительно)"),
-    "as_of": Param(None, type=["null", "string"], format="date", description="дата снимка (по умолчанию — конец окна)"),
+    "as_of": Param(None, type=["null", "string"], format="date", description="дата снимка (по умолчанию AS_OF, иначе последний день данных)"),
 }
 
 
@@ -115,13 +116,13 @@ WINDOW_PARAMS = {
 )
 def ul_platform_backfill():
     window = resolve_window(use_data_interval=False)
-    chain(init_db(), window, extract(window), transform(window), marts(window, full=True),
+    chain(init_db(), window, extract(window), transform(window), marts(window),
           ml_train(window), ml_score(window))
 
 
 @dag(
     dag_id="ul_platform_daily",
-    description="Инкремент за день: extract, transform, инкремент витрины, скоринг",
+    description="Инкремент за день: extract, transform, инкремент витрины, обучение и скоринг на дату снимка",
     schedule="@daily",
     start_date=datetime(2026, 10, 1),
     catchup=False,
@@ -134,7 +135,8 @@ def ul_platform_backfill():
 )
 def ul_platform_daily():
     window = resolve_window(use_data_interval=True)
-    chain(window, extract(window), transform(window), marts(window, full=False), ml_score(window))
+    chain(window, extract(window), transform(window), marts(window, incremental=True),
+          ml_train(window), ml_score(window))
 
 
 @dag(
@@ -152,7 +154,7 @@ def ul_platform_daily():
 )
 def ul_platform_marts_full():
     window = resolve_window(use_data_interval=True)
-    chain(window, marts(window, full=True))
+    chain(window, marts(window))
 
 
 @dag(
@@ -165,7 +167,7 @@ def ul_platform_marts_full():
     is_paused_upon_creation=True,
     default_args=DEFAULT_ARGS,
     params={"start_date": WINDOW_PARAMS["start_date"], "end_date": WINDOW_PARAMS["end_date"]},
-    tags=["clickhouse"],
+    tags=["clickhouse", "bonus"],
     doc_md=__doc__,
 )
 def ul_platform_clickhouse_sync():

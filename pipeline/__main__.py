@@ -5,17 +5,17 @@
     python -m pipeline extract --start 2026-09-01 --end 2026-09-30     # источник -> raw
     python -m pipeline transform --start 2026-09-01 --end 2026-09-30   # raw -> core + карантин
     python -m pipeline etl --start 2026-09-01 --end 2026-09-30         # extract + transform за одно окно
-    python -m pipeline marts         # инкремент: последние N месяцев (MART_LOOKBACK_MONTHS) и пропущенные
-    python -m pipeline marts --full  # все месяцы
-    python -m pipeline ml run        # train + score
-    python -m pipeline run-all       # всё целиком
+    python -m pipeline marts                  # полный пересчёт витрины
+    python -m pipeline marts --incremental    # последние N месяцев и пропущенные
+    python -m pipeline ml run           # train + score
+    python -m pipeline run-all          # всё целиком
 
-    python -m pipeline clickhouse-init   # под администратором ClickHouse
-    python -m pipeline clickhouse-sync --start 2026-10-26 --end 2026-10-26 # инкремент за окно updated_at
-    python -m pipeline clickhouse-sync   # без окна — полная синхронизация
+    python -m pipeline clickhouse-init        # под администратором ClickHouse
+    python -m pipeline clickhouse-sync --start 2026-10-26 --end 2026-10-26   # инкремент за окно updated_at
+    python -m pipeline clickhouse-sync        # без окна — полная синхронизация
 
 Дата снимка as_of (marts, ml, run-all): --as-of > AS_OF из окружения > последний день данных
-(для run-all — конец окна загрузки, для marts / ml — максимальный updated_at в raw).
+(для run-all — последний updated_at в источнике, для marts / ml — в raw); позже него — ошибка.
 """
 
 import argparse
@@ -62,12 +62,12 @@ def _as_of(settings: Settings, args) -> date:
     """as_of для marts / ml: --as-of > AS_OF > последний день данных в raw."""
     from etl.transform import raw_window
     from etl.window import resolve_as_of
-    return resolve_as_of(args.as_of, settings.as_of, lambda: raw_window(settings).end)
+    return resolve_as_of(args.as_of, settings.as_of, raw_window(settings).end)
 
 
 def cmd_marts(settings: Settings, args) -> None:
     from etl.marts import build_marts
-    build_marts(settings, _as_of(settings, args), full=args.full)
+    build_marts(settings, _as_of(settings, args), incremental=args.incremental)
 
 
 def cmd_ml(settings: Settings, args) -> None:
@@ -100,12 +100,13 @@ def cmd_run_all(settings: Settings, args) -> None:
     from etl.window import resolve_as_of, resolve_window
 
     init_db(settings)
-    window = resolve_window(args.start, args.end, lambda: source_window(settings))
-    as_of = resolve_as_of(args.as_of, settings.as_of, lambda: window.end)
+    source = source_window(settings)
+    window = resolve_window(args.start, args.end, lambda: source)
+    as_of = resolve_as_of(args.as_of, settings.as_of, source.end)
     log.info("run_all.window", extra={"start": window.start, "end": window.end, "as_of": as_of})
     run_extract(settings, window)
     run_transform(settings, window)
-    build_marts(settings, as_of, full=True)
+    build_marts(settings, as_of)
 
     from ml.pipeline import score, train
     train(settings, as_of)
@@ -130,9 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=func)
 
     as_of_help = "дата снимка (по умолчанию AS_OF, иначе последний день данных)"
-    p = sub.add_parser("marts", help="пересчёт витрин из core (инкремент по месяцам)")
+    p = sub.add_parser("marts", help="пересчёт витрин из core (по умолчанию все месяцы)")
     p.add_argument("--as-of", type=_date, help=as_of_help)
-    p.add_argument("--full", action="store_true", help="пересчитать все месяцы")
+    p.add_argument("--incremental", action="store_true",
+                   help="только последние MART_LOOKBACK_MONTHS месяцев до as_of и пропущенные")
     p.set_defaults(func=cmd_marts)
 
     p = sub.add_parser("ml", help="обучение и скоринг")
@@ -151,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run-all", help="миграции + extract + transform + витрины + ML")
     p.add_argument("--start", type=_date)
     p.add_argument("--end", type=_date)
-    p.add_argument("--as-of", type=_date, help="дата снимка (по умолчанию AS_OF, иначе конец окна)")
+    p.add_argument("--as-of", type=_date, help="дата снимка (по умолчанию AS_OF, иначе последний день данных)")
     p.set_defaults(func=cmd_run_all)
     return parser
 

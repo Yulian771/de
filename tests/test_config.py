@@ -5,7 +5,6 @@ import pytest
 from psycopg.conninfo import conninfo_to_dict
 
 from common.config import APP_NAME, ClickHouseConfig, DbConfig, Settings
-from common.db import StepRun
 
 ENV_PREFIXES = ("SOURCE_DB", "DWH_DB")
 

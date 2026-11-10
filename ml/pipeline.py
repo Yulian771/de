@@ -1,8 +1,9 @@
 """ML: обучение и скоринг с записью в mart.ml_price_predictions.
 
-Модель сохраняется вместе с метаданными (ModelArtifact): версия, разбиение на дату обучения as_of, признаки.
-Скоринг размечает сделки по as_of модели (test — её отложенный период) и по дате скоринга (future — заявки
-после неё); сделки между ними — live: модель их не видела, факт уже известен.
+Обучаются основная модель (CatBoost) и два baseline (Ridge, DecisionTree) — для сравнения метрик
+в mart.ml_model_metrics. Сохраняется и скорится только основная модель, вместе с метаданными (ModelArtifact):
+версия, разбиение на дату обучения as_of, признаки. Скоринг — на ту же дату снимка: test (отложенный период)
+и future (заявки с loading_date > as_of, факт — NULL).
 """
 
 import json
@@ -28,6 +29,7 @@ from ml.split import TimeSplit
 log = get_logger(__name__)
 
 PRIMARY_MODEL = "catboost"
+MIN_FIT_ROWS = 1000          # минимум строк train вне валидационного хвоста
 
 
 def _seed_everything(seed: int) -> None:
@@ -68,8 +70,13 @@ def train(settings: Settings, as_of: date) -> dict:
             "train_rows": len(train_df), "val_rows_inside_train": int(val_mask.sum()), "test_rows": len(test_df),
             "train_max_date": train_df["loading_date"].max(), "test_min_date": test_df["loading_date"].min(),
         })
-        if train_df.empty or test_df.empty:
-            raise RuntimeError(f"Empty train or test for as_of {as_of}: train={len(train_df)} test={len(test_df)}")
+        fit_rows = int((~val_mask).sum())
+        if fit_rows < MIN_FIT_ROWS or not val_mask.any() or test_df.empty:
+            raise RuntimeError(
+                f"Not enough data to train for as_of {as_of}: {fit_rows} train rows before {split.val_start} "
+                f"(need >= {MIN_FIT_ROWS}), {int(val_mask.sum())} validation rows, {len(test_df)} test rows. "
+                f"Load deals with loading dates from {split.train_start} to {split.as_of} "
+                f"(etl window by updated_at must cover them).")
         assert train_df["loading_date"].max() < test_df["loading_date"].min(), "temporal leakage"
 
         trained_at = datetime.now(timezone.utc).replace(microsecond=0)
@@ -80,9 +87,10 @@ def train(settings: Settings, as_of: date) -> dict:
             model.fit(train_df, train_df[TARGET], val_mask)
             metrics = regression_metrics(test_df[TARGET], model.predict(test_df))
             results[model.name] = {"metrics": metrics, "params": model.params()}
-            _atomic_dump(ModelArtifact(name=model.name, version=version, split=split, trained_at=trained_at,
-                                       features=list(FEATURES), model=model),
-                         settings.model_dir / f"{model.name}.joblib")
+            if model.name == PRIMARY_MODEL:                     # baselines нужны только для метрик
+                _atomic_dump(ModelArtifact(name=model.name, version=version, split=split, trained_at=trained_at,
+                                           features=list(FEATURES), model=model),
+                             settings.model_dir / f"{model.name}.joblib")
             log.info("ml.model.trained", extra={"model": model.name, "model_version": version, **metrics})
             if isinstance(model, CatBoostModel):
                 results[model.name]["feature_importance"] = model.feature_importance()
@@ -128,47 +136,44 @@ def load_artifact(settings: Settings, name: str) -> ModelArtifact:
     return artifact
 
 
-def score(settings: Settings, as_of: date, models: tuple[str, ...] = (PRIMARY_MODEL, "ridge", "decision_tree")) -> dict:
-    """Скоринг на дату as_of: test и live (с фактом) и future."""
+def score(settings: Settings, as_of: date) -> dict:
+    """Скоринг основной модели на дату снимка as_of (той же, что при обучении): test — отложенный период
+    с фактом и ошибкой, future — заявки с loading_date > as_of, факт и ошибка — NULL.
+
+    Перезаписывает таблицу прогнозов целиком (DELETE + COPY в одной транзакции) — идемпотентно.
+    """
     with step_run(settings.dwh_db, "ml_score") as run:
-        artifacts = [load_artifact(settings, name) for name in models]
-        datasets: dict[date, pd.DataFrame] = {}
+        artifact = load_artifact(settings, PRIMARY_MODEL)
+        artifact.split.require_as_of(as_of)
+        df = load_dataset(settings, artifact.split.test_start)
+        masks = artifact.split.masks(df["loading_date"])
+        scope = df[masks["test"] | masks["future"]].copy()
+        scope["split"] = np.where(masks["future"].loc[scope.index], "future", "test")
+
+        pred = np.round(artifact.model.predict(scope), 2)
+        is_test = scope["split"].to_numpy() == "test"
+        actual = np.where(is_test, scope[TARGET].round(2), np.nan)          # для будущих — NULL
+        abs_err = np.abs(actual - pred)
+        ape = abs_err / actual * 100
         scored_at = datetime.now(timezone.utc)
 
         with connect(settings.dwh_db) as conn, conn.transaction():
-            for artifact in artifacts:
-                min_date = artifact.split.test_start
-                if min_date not in datasets:
-                    datasets[min_date] = load_dataset(settings, min_date)
-                df = datasets[min_date]
-                labels = artifact.split.scoring_labels(df["loading_date"], as_of)
-                scope = df[labels.notna()].copy()
-                scope["split"] = labels[labels.notna()]
-
-                pred = np.round(artifact.model.predict(scope), 2)
-                has_actual = scope["split"].to_numpy() != "future"
-                actual = np.where(has_actual, scope[TARGET].round(2), np.nan)   # для будущих — NULL
-                abs_err = np.abs(actual - pred)
-                ape = abs_err / actual * 100
-
-                name = artifact.name
-                conn.execute("DELETE FROM mart.ml_price_predictions WHERE model_name = %s", (name,))
-                with conn.cursor().copy(
-                    "COPY mart.ml_price_predictions (price_id, model_name, model_version, split, loading_date, "
-                    "loading_city_gcid, unloading_city_gcid, body_group, weight_category, distance, outlier_mark, "
-                    "actual_price_rub, predicted_price_rub, abs_error_rub, ape_pct, scored_at) FROM STDIN"
-                ) as copy:
-                    n = len(scope)
-                    for row in zip(scope["price_id"], [name] * n, [artifact.version] * n, scope["split"],
-                                   scope["loading_date"], scope["loading_city_gcid"], scope["unloading_city_gcid"],
-                                   scope["body_group"], scope["weight_category"], scope["distance"],
-                                   scope["outlier_mark"], _nullable(actual), pred, _nullable(abs_err),
-                                   _nullable(np.round(ape, 2)), [scored_at] * n):
-                        copy.write_row(row)
-                counts = scope["split"].value_counts()
-                run.stats[name] = {"model_version": artifact.version, "model_as_of": artifact.split.as_of,
-                                   **{f"{s}_rows": int(counts.get(s, 0)) for s in ("test", "live", "future")}}
-                log.info("ml.scored", extra={"model": name, "as_of": as_of, **run.stats[name]})
+            conn.execute("DELETE FROM mart.ml_price_predictions")
+            with conn.cursor().copy(
+                "COPY mart.ml_price_predictions (price_id, model_name, model_version, split, loading_date, "
+                "loading_city_gcid, unloading_city_gcid, body_group, weight_category, distance, outlier_mark, "
+                "actual_price_rub, predicted_price_rub, abs_error_rub, ape_pct, scored_at) FROM STDIN"
+            ) as copy:
+                n = len(scope)
+                for row in zip(scope["price_id"], [artifact.name] * n, [artifact.version] * n, scope["split"],
+                               scope["loading_date"], scope["loading_city_gcid"], scope["unloading_city_gcid"],
+                               scope["body_group"], scope["weight_category"], scope["distance"],
+                               scope["outlier_mark"], _nullable(actual), pred, _nullable(abs_err),
+                               _nullable(np.round(ape, 2)), [scored_at] * n):
+                    copy.write_row(row)
+        run.stats.update({"model": artifact.name, "model_version": artifact.version, "as_of": as_of,
+                          "test_rows": int(is_test.sum()), "future_rows": int((~is_test).sum())})
+        log.info("ml.scored", extra=run.stats)
     return run.stats
 
 
